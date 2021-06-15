@@ -2,16 +2,88 @@
 # gary.py
 # =======
 #
-# Main Gary module.
-#
-# Note: this requires POSIX/Unix for the fcntl module.  See portalocker
-# for platform-independent locking.
-#
-# You can configure the ISBNdb endpoint address to use below.  The
-# default value is appropriate for regular subscribers.  If you have a
-# Premium or Pro account at ISBNdb, you can change the access address to
-# those special endpoints.
-#
+
+"""
+Gary proxy program for ISBNdb.
+
+Syntax
+------
+
+  python gary.py [dbpath] json [isbn]
+  python gary.py [dbpath] pic [isbn]
+  python gary.py [dbpath] query [isbn]
+  python gary.py [dbpath] sync
+
+[dbpath] is the path to the Gary database.  You can use the
+gary_createdb.py script to create a new database and gary_admin.py to
+administer a Gary database.
+
+[isbn] is an ISBN-10 or ISBN-13 number for the book.  It does not need
+to be normalized.  This script will automatically normalize it to an
+ISBN-13.
+
+Standard input is not used for all modes except "sync" and may be set to
+/dev/null
+
+For "sync" mode, standard input contains a text file listing ISBN
+numbers, one per line.  They can be either ISBN-10 or ISBN-13 and they
+do not need to be normalized.  Gary will attempt to use query to
+successfully load information for ALL these ISBN numbers, calling the
+function in a loop for each ISBN until it succeeds.  The operation only
+succeeds if ALL ISBN numbers are loaded into the database.  Note that
+this operation may take a long time, so don't call from a CGI script.
+Also note that if any of the ISBNs aren't in ISBNdb, this function will
+keep retrying for many times, so be sure to keep an eye on the script
+when using this function.  If interrupted, any ISBN numbers loaded so
+far are kept, so you can retry this multiple times if it is taking too
+long.
+
+Standard error may be ignored and set to /dev/null  For "sync" mode,
+each ISBN number successfully queried is written.
+
+Standard output for "json" mode returns either the same JSON that was
+returned from ISBNdb, or it returns the string "false" which decodes to
+a JSON value of false if information on the book couldn't be retrieved.
+
+Standard output for "pic" mode returns the raw binary data of the image,
+or a line of text reading "false" if no picture is available.
+
+Both the "json" and "pic" will query ISBNdb if necessary to retrieve the
+book information.
+
+Standard output for "query" mode returns either JSON "true" or "false"
+indicating whether information about the book was successfully cached in
+the local Gary database.  If the book is already in the database, this
+simply returns true without anything further.  Else, it attempts to
+contact ISBNdb for the information.
+
+Standard output for "sync" mode is either JSON "true" or "false"
+indicating whether the operation succeeded.
+
+Importing a list of ISBNs from a SQLite database
+------------------------------------------------
+
+Use sqlite3 tool to open the database.  Use:
+
+  .output isbn_list.txt
+
+To redirect query output to a text file.  Then, run a query that selects
+only the ISBN column.  Once you close the sqlite3 tool, you'll have a
+text file with ISBN numbers that you can use with the "sync" mode on
+Gary to make sure Gary has all the books.
+
+Important notes
+---------------
+
+This script requires POSIX/Unix for the fcntl module.  See portalocker
+for platform-independent locking, but you will need to adapt the script
+to use that.
+
+You can configure the ISBNdb endpoint address to use below.  The default
+value is appropriate for regular subscribers.  If you have a Premium or
+Pro account at ISBNdb, you can change the access address to those
+special endpoints.
+"""
 
 import base64
 import datetime
@@ -23,8 +95,32 @@ import math
 import os
 import os.path
 import sqlite3
+import sys
 import time
+import traceback
 import urllib.request
+
+# Don't export anything
+#
+__all__ = []
+
+#
+# Module name
+# -----------
+#
+# Used for error reporting.  This is the name of the executable program
+# module passed in through argv.  A default value is used if it can't be
+# read from argv.
+#
+# pModule is the string, with a colon added to the end of it so it can
+# easily be used in print statements.  Include a file=sys.stderr
+# parameter in print error statements so they get printed to stderr.
+#
+
+pModule = 'gary:'
+if len(sys.argv) > 0:
+  if isinstance(sys.argv[0], str):
+    pModule = sys.argv[0] + ':'
 
 #
 # ISBNdb endpoint address
@@ -38,6 +134,16 @@ import urllib.request
 #
 
 ISBNDB_ENDPOINT = 'https://api2.isbndb.com/book/'
+
+#
+# Long retry count
+# ----------------
+#
+# This is the number of times that query() is retried in a loop during
+# the "sync" mode.  It is not used in any other mode.
+#
+
+LONG_RETRY_COUNT = 20
 
 #
 # Exception classes
@@ -54,9 +160,9 @@ class GaryError(Exception):
   def __str__(self):
     return 'Unknown error!'
 
-class AuthFailedError(GaryError):
+class BadSyncListError(GaryError):
   def __str__(self):
-    return 'Gary API key is not valid!'
+    return 'Provided sync list contains invalid ISBN numbers!'
 
 class DatabaseIntegrityError(GaryError):
   def __str__(self):
@@ -65,6 +171,10 @@ class DatabaseIntegrityError(GaryError):
 class InvalidISBNError(GaryError):
   def __str__(self):
     return 'ISBN-13 number is not valid or not normalized!'
+
+class ISBNParamError(GaryError):
+  def __str__(self):
+    return 'Provided ISBN number is not valid!'
 
 class LockError(GaryError):
   def __str__(self):
@@ -90,156 +200,319 @@ class OpenLockfileError(GaryError):
   def __str__(self):
     return 'Can\'t open lockfile!'
 
+class ProgramModeError(GaryError):
+  def __str__(self):
+    return 'Unrecognized program mode!'
+
+class ProgramParamError(GaryError):
+  def __str__(self):
+    return 'Wrong number of parameters for program mode!'
+
 class SQLError(GaryError):
   def __str__(self):
     return 'Error running SQL statements against Gary database!'
+
+class SyncError(GaryError):
+  def __str__(self):
+    return 'Sync operation failed!'
 
 #
 # Local functions
 # ---------------
 #
 
-# Check whether the given value is a valid Gary API key.
-#
-# This returns True only if the given value is a string that has exactly
-# 32 characters, and each of these is an ASCII alphanumeric or - or _
-#
-# This does NOT check whether the key is actually registered in the
-# database.  It just checks the format.
-#
-# Parameters:
-#
-#   s : str | mixed - the value to check
-#
-# Return:
-#
-#   True if the value is a valid Gary API key format, False otherwise
-#
-def valid_key(s):
+def norm_isbn_str(s):
+  """
+  Given an ISBN string, normalize the string so that it only contains 
+  the relevant digits.
+   
+  This function drops all ASCII whitespace characters (tab, space,
+  carriage return, line feed) and all ASCII characters that are not
+  alphanumeric.
+   
+  It also converts all ASCII letters to uppercase.  Note that ISBN-10
+  numbers may have an "X" as their check digit!
+   
+  This function does NOT guarantee that the value it returns is a valid
+  ISBN.
+   
+  Passing a non-string as the parameter is equivalent to passing an 
+  empty string.
+   
+  Parameters:
+   
+    s : str | mixed - the ISBN number string to normalize
+   
+  Return:
+   
+    the normalized ISBN string, which is NOT guaranteed to be valid
+  """
   
-  # Check type
+  # If non-string passed, replace with empty string
+  if not isinstance(s, str):
+    s = ''
+  
+  # Begin with an empty result
+  isbn = ''
+  
+  # Go through each character of the string
+  for cc in s:
+    
+    # Get current character code
+    c = ord(cc)
+    
+    # Handle based on character type
+    if (c >= ord('a')) and (c <= ord('z')):
+      # Lowercase letter, so transfer uppercase to normalized ISBN
+      isbn = isbn + chr(c - 0x20)
+    
+    elif (c >= ord('A')) and (c <= ord('Z')):
+      # Uppercase letter, so transfer to normalized ISBN
+      isbn = isbn + chr(c)
+    
+    elif (c >= ord('0')) and (c <= ord('9')):
+      # Digit, so transfer to normalized ISBN
+      isbn = isbn + chr(c)
+    
+    elif (c >= 0x21) and (c <= 0x7e):
+      # Non-alphanumeric symbol, so don't transfer
+      pass
+    
+    elif (c == ord('\t')) or (c == ord('\r')) or \
+          (c == ord('\n')) or (c == ord(' ')):
+      # Whitespace, so don't transfer
+      pass
+    
+    else:
+      # Control or extended character, so transfer to normalized
+      isbn = isbn + chr(c)
+
+  # Return normalized string
+  return isbn
+
+def compute_isbn_check(s):
+  """
+  Given the first 9 digits of an ISBN-10 or the first 12 digits of an
+  ISBN-13, return a one-character string that holds the check digit.
+   
+  For ISBN-13, the check digit string is always an ASCII decimal digit
+  in range 0-9.
+   
+  For ISBN-10, the check digit might also be an uppercase letter X!
+   
+  If the given parameter is not a string, it does not have a valid
+  length, or it contains invalid digits, then False is returned.
+   
+  Parameters:
+   
+    s : str | mixed - the string of digits to check
+   
+  Return:
+   
+    a one-character string with the check digit, or False if given
+    parameter is not valid
+  """
+  
+  # Check type of parameter
   if not isinstance(s, str):
     return False
   
-  # Check length
-  if len(s) != 32:
-    return False
-  
-  # Check each character
+  # Check that all digits are valid
   for cc in s:
-    c = ord(cc)
-    if ((c < ord('A')) or (c > ord('Z'))) and \
-        ((c < ord('a')) or (c > ord('z'))) and \
-        ((c < ord('0')) or (c > ord('9'))) and \
-        (c != ord('-')) and (c != ord('_')):
-      return False
-
-  # If we got here, key is in valid format
-  return True
-
-# Attempt to authorize the given Gary API key in the given Gary
-# database.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# s is the key to authorize.  It must pass valid_key().
-#
-# If successful, this function does nothing.  If there is any problem,
-# or if the API key does not validate with the client table in the
-# database, some kind of exception is thrown.
-#
-# If this function returns without exception, then the provided Gary API
-# key is valid credentials against the given database.
-#
-# Parameters:
-#
-#   dbc - Connection : the Gary SQLite3 database
-#
-#   s - str : the Gary API key for authorization
-#
-def auth_key(dbc, s):
-  
-  # Check database connection
-  if not isinstance(dbc, sqlite3.Connection):
-    raise LogicError()
-  if dbc.isolation_level != None:
-    raise LogicError()
-  
-  # Check format of API key
-  if not valid_key(s):
-    raise LogicError()
-  
-  # Extract the user ID and password from key
-  s_usr = s[0:8]
-  s_pswd = s[8:]
-  
-  # Get the SHA-256 hash of the password encoded in base64
-  m = hashlib.sha256()
-  m.update(s_pswd.encode(encoding='utf-8'))
-  s_pswd = str(base64.b64encode(m.digest()), encoding='utf-8')
-  
-  # Get a cursor for reading the database
-  cur = None
-  try:
-    cur = dbc.cursor()
-  except Exception as e:
-    raise OpenCursorError() from e
-  
-  # Wrap the rest in a try-finally so that the cursor is always closed
-  # on the way out; also, rethrow any exceptions as SQLErrors except for
-  # AuthFailedError
-  try:
-    # Begin a deferred transaction because we're only reading
-    cur.execute('BEGIN DEFERRED TRANSACTION')
     
-    # Wrap the rest in a try-catch so that in case of any error, the
-    # transaction is rolled back before the exception is rethrown
-    try:
-      # Attempt to look up the SHA-256 hash of the client password
-      cur.execute('SELECT pswd FROM client WHERE tkid=?', (s_usr,))
-      
-      # Get record -- if no record, authorization failed
-      r = cur.fetchone()
-      if r is None:
-        raise AuthFailedError()
-      
-      # Compare password hashes with secure comparison function to
-      # prevent timing attacks
-      if not hmac.compare_digest(r[0], s_pswd):
-        raise AuthFailedError()
-      
-      # Commit the transaction to update the database all at once
-      cur.execute('COMMIT TRANSACTION')
-      
-    except Exception as f:
-      cur.execute('ROLLBACK TRANSACTION')
-      raise f
+    # Get current character code
+    c = ord(cc)
+    
+    # Character must be decimal digit
+    if (c < ord('0')) or (c > ord('9')):
+      return False
   
-  except AuthFailedError as afe:
-    raise afe
+  # Handle ISBN-13 and ISBN-10 separately
+  result = False
+  if len(s) == 9:
+    # ISBN-10 number, so compute the weighted sum of the non-check
+    # digits
+    wsum = 0
+    for i in range(0, 9):
+      wsum = wsum + ((10 - i) * (ord(s[i]) - ord('0')))
+    
+    # Get the remainder of the weighted sum divided by 11
+    r = wsum % 11
+    
+    # If remainder is zero, check value is also zero; else, check value
+    # is 11 subtracted by remainder
+    checkv = 0
+    if r > 0:
+      checkv = 11 - r
+    
+    # Convert the check value to either a decimal digit or X
+    if (checkv >= 0) and (checkv < 10):
+      result = chr(ord('0')  + checkv)
+    elif checkv == 10:
+      result = 'X'
+    else:
+      # Shouldn't happen
+      raise LogicError()
+    
+  elif len(s) == 12:
+    # ISBN-13 number, so compute the weighted sum of the non-check
+    # digits
+    wsum = 0
+    for i in range(0, 12):
+      
+      # Get current digit value
+      d = ord(s[i]) - ord('0')
+      
+      # If zero-based character index mod 2 is one, then weight is 3;
+      # else, it is one 
+      r = 1
+      if (i % 2) == 1:
+        r = 3
+      
+      # Update weighted sum
+      wsum = wsum + (r * d)
+    
+    # Get the remainder of the weighted sum divided by 10
+    r = wsum % 10
+    
+    # If the remainder is zero, check value is also zero; else, check
+    # value is 10 subtracted by remainder
+    checkv = 0
+    if r > 0:
+      checkv = 10 - r
+    
+    # Convert the check value to a decimal digit
+    if (checkv >= 0) and (checkv < 10):
+      result = chr(ord('0') + checkv)
+    else:
+      # Shouldn't happen
+      raise LogicError()
+    
+  else:
+    # Not a recognized length, so return false
+    result = False
   
-  except Exception as e:
-    raise SQLError() from e
-  
-  finally:
-    cur.close()
+  # Return result
+  return result
 
-# Check whether the given string is a valid, normalized ISBN-13 number.
-#
-# This only passes if the given value is a string that has exactly 13
-# decimal digits, and the last decimal digit is a proper ISBN-13 check
-# digit.
-#
-# Parameters:
-#
-#   s : str | mixed - the value to check
-#
-# Return:
-#
-#   True if a valid, normalized ISBN-13 number, False otherwise
-#
+def norm_isbn(s):
+  """
+  Given an ISBN-10 or ISBN-13 string, normalize it to an ISBN-13 string.
+   
+  ISBN-10 numbers are converted to ISBN-13.
+   
+  If the given variable is not a string, or it is a string but not in a
+  valid ISBN format, or it is a ISBN-10 or ISBN-13 string but the check
+  digit is incorrect, the function returns false.
+   
+  Normalizing the same value more than once has no effect, so you can
+  safely normalize multiple times.
+   
+  You can check whether an ISBN is valid by normalizing it with this
+  function.  If normalization returns an ISBN, it is valid; otherwise,
+  False is returned, indicating that the given ISBN was not valid.
+   
+  Parameters:
+   
+    s : str | mixed - the ISBN-10 or ISBN-13 text to normalize
+   
+  Return:
+   
+    the normalized ISBN-13 number, or False if there was a problem with
+    the given parameter
+  """
+  
+  # Normalize ISBN text
+  s = norm_isbn_str(s)
+  
+  # Handle either ISBN-10 or ISBN-13
+  result = False
+  if len(s) == 10:
+    # ISBN-10, so part into main digits and check digit
+    md = s[0:9]
+    cd = s[9]
+    
+    # Compute what check digit should be
+    cds = compute_isbn_check(md)
+    
+    # Only proceed if computation was successful; else, ISBN number is
+    # not valid and return false
+    if cds != False:
+      
+      # Only proceed if computed check digit matches given check digit;
+      # else, ISBN number is not valid and return false
+      if cds == cd:
+        # Convert ISBN-10 to ISBN-13 first by prefixing 978 to the main
+        # digits
+        md = '978' + md
+        
+        # Next, recompute check digit for ISBN-13
+        cd = compute_isbn_check(md)
+        if cd == False:
+          # Shouldn't happen
+          raise LogicError()
+        
+        # Form the result as the ISBN-13 conversion
+        result = md + cd
+      
+      else:
+        # Check digit was not correct
+        result = False
+      
+    else:
+      # ISBN-10 was not valid
+      result = False
+    
+  elif len(s) == 13:
+    # ISBN-13 number, so part into main digits and check digit
+    md = s[0:12]
+    cd = s[12]
+    
+    # Compute what the check digit should be
+    cds = compute_isbn_check(md)
+    
+    # Only proceed if computation was successful; else, ISBN number is
+    # not valid and return false
+    if cds != False:
+      
+      # Only proceed if computed check digit matches given check digit;
+      # else, ISBN number is not valid and return False
+      if cds == cd:
+        # Check digit was correct, so we can use the normalized ISBN-13
+        # string as our result
+        result = s
+      
+      else:
+        # Check digit was not correct
+        result = False
+    
+    else:
+      # ISBN-13 was not valid
+      result = False
+    
+  else:
+    # Not a valid ISBN string
+    result = False
+  
+  # Return result
+  return result
+
 def is_isbn13(s):
+  """
+  Check whether the given string is a valid, normalized ISBN-13 number.
+
+  This only passes if the given value is a string that has exactly 13
+  decimal digits, and the last decimal digit is a proper ISBN-13 check
+  digit.
+
+  Parameters:
+
+    s : str | mixed - the value to check
+
+  Return:
+
+    True if a valid, normalized ISBN-13 number, False otherwise
+  """
   
   # Fail if not a string
   if not isinstance(s, str):
@@ -276,26 +549,27 @@ def is_isbn13(s):
   else:
     return False
 
-# Given an ISBN-13 number, apply a remapping from the ISBN-13 remapping
-# table in the database if necessary.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# The given ISBN-13 must be a normalized ISBN that passes is_isbn13().
-#
-# Parameters:
-#
-#   dbc - Connection : the Gary SQLite3 database
-#
-#   isbn13 - str : the ISBN-13 number to check for remaps
-#
-# Return:
-#
-#   the remapped ISBN-13 number, or the given ISBN-13 number if there
-#   are no remappings
-#
 def apply_remap(dbc, isbn13):
+  """
+  Given an ISBN-13 number, apply a remapping from the ISBN-13 remapping
+  table in the database if necessary.
+
+  dbc is the open connection to the Gary database.  It must be open in
+  auto-commit mode (isolation_level is None).
+
+  The given ISBN-13 must be a normalized ISBN that passes is_isbn13().
+
+  Parameters:
+
+    dbc - Connection : the Gary SQLite3 database
+
+    isbn13 - str : the ISBN-13 number to check for remaps
+
+  Return:
+
+    the remapped ISBN-13 number, or the given ISBN-13 number if there
+    are no remappings
+  """
   
   # Check database connection
   if not isinstance(dbc, sqlite3.Connection):
@@ -354,33 +628,34 @@ def apply_remap(dbc, isbn13):
   # If we got here, return the (possibly remapped) ISBN-13
   return isbn13
 
-# Check whether information about the given ISBN-13 is already cached
-# within the Gary database.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# The given ISBN-13 must be a normalized ISBN that passes is_isbn13().
-#
-# This does NOT apply ISBN-13 remaps, so do that before checking.
-#
-# If the optional imode parameter is set to True, the transaction will
-# be an immediate transaction instead of a deferred transaction.
-#
-# Parameters:
-#
-#   dbc : Connection - the Gary SQLite3 database
-#
-#   isbn13 : str - the ISBN-13 number to check for in the database cache
-#
-#   imode : bool - (Optional) True to use an immediate transaction,
-#   False to use a deferred transaction
-#
-# Return:
-#
-#   True if the information is already cached, False otherwise
-#
 def isbn_cached(dbc, isbn13, imode=False):
+  """
+  Check whether information about the given ISBN-13 is already cached
+  within the Gary database.
+
+  dbc is the open connection to the Gary database.  It must be open in
+  auto-commit mode (isolation_level is None).
+
+  The given ISBN-13 must be a normalized ISBN that passes is_isbn13().
+
+  This does NOT apply ISBN-13 remaps, so do that before checking.
+
+  If the optional imode parameter is set to True, the transaction will
+  be an immediate transaction instead of a deferred transaction.
+
+  Parameters:
+
+    dbc : Connection - the Gary SQLite3 database
+
+    isbn13 : str - the ISBN-13 number to check for in the database cache
+
+    imode : bool - (Optional) True to use an immediate transaction,
+    False to use a deferred transaction
+
+  Return:
+
+    True if the information is already cached, False otherwise
+  """
   
   # Check imode
   if not isinstance(imode, bool):
@@ -443,31 +718,32 @@ def isbn_cached(dbc, isbn13, imode=False):
   # If we got here, return the result
   return result
 
-# Return the checked ISBNdb access information from the given Gary
-# database.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# If there is an ISBNdb API key and a lockfile in the database, and the
-# lockfile is an absolute path that indicates an existing regular file
-# that is not a symbolic link, then the return value is a tuple of two
-# strings, where the first element is the ISBNdb API key and the second
-# element is the absolute file path to the lockfile.  Otherwise, the
-# return value is None, indicating that ISBNdb information is not
-# present in the Gary database.
-#
-# Parameters:
-#
-#   dbc : Connection - the Gary SQLite3 database
-#
-# Return:
-#
-#   a tuple pair of strings, the first of which is the ISBNdb API key
-#   and the second of which is the lockfile path; or returns None if
-#   the ISBNdb information is not in the database
-#
 def isbndb_param(dbc):
+  """
+  Return the checked ISBNdb access information from the given Gary
+  database.
+
+  dbc is the open connection to the Gary database.  It must be open in
+  auto-commit mode (isolation_level is None).
+
+  If there is an ISBNdb API key and a lockfile in the database, and the
+  lockfile is an absolute path that indicates an existing regular file
+  that is not a symbolic link, then the return value is a tuple of two
+  strings, where the first element is the ISBNdb API key and the second
+  element is the absolute file path to the lockfile.  Otherwise, the
+  return value is None, indicating that ISBNdb information is not
+  present in the Gary database.
+
+  Parameters:
+
+    dbc : Connection - the Gary SQLite3 database
+
+  Return:
+
+    a tuple pair of strings, the first of which is the ISBNdb API key
+    and the second of which is the lockfile path; or returns None if
+    the ISBNdb information is not in the database
+  """
   
   # Check database connection
   if not isinstance(dbc, sqlite3.Connection):
@@ -534,49 +810,50 @@ def isbndb_param(dbc):
   # Return result
   return result
 
-# Query ISBNdb for JSON information about a book.
-#
-# Returns the JSON information if successful and None if information
-# couldn't be found.  This function does NOT perform retries.  It only
-# performs one attempt, without any delays.  Use isbndb_query() for the
-# full querying protocol.
-#
-# IMPORTANT: this function assumes that you have acquired and are
-# holding an exclusive lock on the ISBNdb lockfile defined in the Gary
-# database keys table.  This ensures that only one Gary instance is
-# contacting ISBNdb at a time, and that only one Gary instance is adding
-# new book information into the database at a time.
-#
-# akey is the API key to use with ISBNdb.
-#
-# isbn13 is the ISBN-13 of the book to query.  This function does NOT
-# apply ISBN remapping, so you should use the apply_remap() function on
-# ISBN before calling this function.  The ISBN-13 must be normalized and
-# pass is_isbn13()
-#
-# This function does NOT check whether information about the book is
-# already in the database.
-#
-# This uses the global variable ISBNDB_ENDPOINT defined in this module
-# to determine where to send queries.  See the documentation of that
-# global variable for further information.
-#
-# If a string is returned, this function will already have verified that
-# it can be parsed as JSON that contains an object with a field "book"
-# that is also a JSON object.
-#
-# Parameters:
-#
-#   akey : str - the ISBNdb API key
-#
-#   isbn13 : str - the normalized ISBN-13 to look for
-#
-# Return:
-#
-#   the JSON information from ISBNdb about the book, or None if the
-#   information was not received
-#
 def json_query(akey, isbn13):
+  """
+  Query ISBNdb for JSON information about a book.
+
+  Returns the JSON information if successful and None if information
+  couldn't be found.  This function does NOT perform retries.  It only
+  performs one attempt, without any delays.  Use isbndb_query() for the
+  full querying protocol.
+
+  IMPORTANT: this function assumes that you have acquired and are
+  holding an exclusive lock on the ISBNdb lockfile defined in the Gary
+  database keys table.  This ensures that only one Gary instance is
+  contacting ISBNdb at a time, and that only one Gary instance is adding
+  new book information into the database at a time.
+
+  akey is the API key to use with ISBNdb.
+
+  isbn13 is the ISBN-13 of the book to query.  This function does NOT
+  apply ISBN remapping, so you should use the apply_remap() function on
+  ISBN before calling this function.  The ISBN-13 must be normalized and
+  pass is_isbn13()
+
+  This function does NOT check whether information about the book is
+  already in the database.
+
+  This uses the global variable ISBNDB_ENDPOINT defined in this module
+  to determine where to send queries.  See the documentation of that
+  global variable for further information.
+
+  If a string is returned, this function will already have verified that
+  it can be parsed as JSON that contains an object with a field "book"
+  that is also a JSON object.
+
+  Parameters:
+
+    akey : str - the ISBNdb API key
+
+    isbn13 : str - the normalized ISBN-13 to look for
+
+  Return:
+
+    the JSON information from ISBNdb about the book, or None if the
+    information was not received
+  """
   
   global ISBNDB_ENDPOINT
   
@@ -629,31 +906,32 @@ def json_query(akey, isbn13):
   # with book information, so return it
   return rtxt
 
-# Download an image file from a URL.
-#
-# Returns the bytes object with the raw image data if successful and
-# None if image couldn't be downloaded.  This function does NOT perform
-# retries.  It only performs one attempt, without any delays.  Use
-# isbndb_query() for the full querying protocol.
-#
-# iurl is the full URL to the image.  This function merely checks that
-# the URL is a string without any further validation before attempting
-# to request it.
-#
-# The function will succeed if a 200 OK status code is received.  The
-# function does not validate that the data returned is actually a valid
-# image file.
-#
-# Parameters:
-#
-#   iurl : str - the image URL to query
-#
-# Return:
-#
-#   a bytes object containing the raw image bytes, or None if the image
-#   file couldn't be downloaded
-#
 def img_query(iurl):
+  """
+  Download an image file from a URL.
+
+  Returns the bytes object with the raw image data if successful and
+  None if image couldn't be downloaded.  This function does NOT perform
+  retries.  It only performs one attempt, without any delays.  Use
+  isbndb_query() for the full querying protocol.
+
+  iurl is the full URL to the image.  This function merely checks that
+  the URL is a string without any further validation before attempting
+  to request it.
+
+  The function will succeed if a 200 OK status code is received.  The
+  function does not validate that the data returned is actually a valid
+  image file.
+
+  Parameters:
+
+    iurl : str - the image URL to query
+
+  Return:
+
+    a bytes object containing the raw image bytes, or None if the image
+    file couldn't be downloaded
+  """
   
   # Check parameter type
   if not isinstance(iurl, str):
@@ -677,74 +955,75 @@ def img_query(iurl):
   # Return downloaded image
   return rs
 
-# Consult ISBNdb and attempt to load information about a book and cache
-# it in the Gary database.
-#
-# If the book is already in the database, this call just returns True
-# without contacting ISBNdb.
-#
-# IMPORTANT: this function assumes that you have acquired and are
-# holding an exclusive lock on the ISBNdb lockfile defined in the Gary
-# database keys table.  This ensures that only one Gary instance is
-# contacting ISBNdb at a time, and that only one Gary instance is adding
-# new book information into the database at a time.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# akey is the API key to use with ISBNdb.
-#
-# isbn13 is the ISBN-13 of the book to query.  This function does NOT
-# apply ISBN remapping, so you should use the apply_remap() function on
-# ISBN before calling this function.  The ISBN-13 must be normalized and
-# pass is_isbn13()
-#
-# This function will perform retries and delays if there are problems
-# contacting ISBNdb, so there should be no need for clients to do that.
-#
-# The optional parameters control how many retries are done, how long
-# the delays are between retries, and how much the delay is after the
-# last query.  Sensible defaults are given.  jretry and jdelay are the
-# retry count and delay in seconds for fetching JSON information, iretry
-# and idelay are the corresponding parameters for fetching the cover
-# image, fdelay is the delay in seconds after the last contact operation
-# to ISBNdb.  The retry counts include the first attempt and so they
-# must be greater than zero.  They can be a maximum of 8.  The delays
-# must be floats or integers that are zero or greater.  Maximum delays
-# are 15 seconds, with greater values clamped to 15 seconds.
-#
-# Parameters:
-#
-#   dbc : Connection - the Gary SQLite3 database
-#
-#   akey : str - the ISBNdb API key
-#
-#   isbn13 : str - the normalized ISBN-13 to look for
-#
-#   jretry : int - (optional) the number of attempts to make at fetching
-#   JSON data for a book, defaults at a total of 3 attempts
-#
-#   jdelay : int | float - (optional) the number of seconds to delay
-#   between attempts to fetch JSON data for a book, defaults at 2
-#   seconds
-#
-#   iretry : int - (optional) the number of attempts to make at fetching
-#   a cover image for a book, defaults at a total of 3 attempts
-#
-#   idelay : int | float - (optional) the number of seconds to delay
-#   between attempts to fetch a cover image for a book, defaults at one
-#   second
-#
-#   fdelay : int | float - (optional) the number of seconds to delay
-#   after the last call to ISBNdb before returning, defaults at two
-#   seconds
-#
-# Return:
-#
-#   True if the book is now in the Gary database, False otherwise
-# 
 def isbndb_query(dbc, akey, isbn13,
                 jretry=3, jdelay=2.0, iretry=3, idelay=1.0, fdelay=2.0):
+  """
+  Consult ISBNdb and attempt to load information about a book and cache
+  it in the Gary database.
+
+  If the book is already in the database, this call just returns True
+  without contacting ISBNdb.
+
+  IMPORTANT: this function assumes that you have acquired and are
+  holding an exclusive lock on the ISBNdb lockfile defined in the Gary
+  database keys table.  This ensures that only one Gary instance is
+  contacting ISBNdb at a time, and that only one Gary instance is adding
+  new book information into the database at a time.
+
+  dbc is the open connection to the Gary database.  It must be open in
+  auto-commit mode (isolation_level is None).
+
+  akey is the API key to use with ISBNdb.
+
+  isbn13 is the ISBN-13 of the book to query.  This function does NOT
+  apply ISBN remapping, so you should use the apply_remap() function on
+  ISBN before calling this function.  The ISBN-13 must be normalized and
+  pass is_isbn13()
+
+  This function will perform retries and delays if there are problems
+  contacting ISBNdb, so there should be no need for clients to do that.
+
+  The optional parameters control how many retries are done, how long
+  the delays are between retries, and how much the delay is after the
+  last query.  Sensible defaults are given.  jretry and jdelay are the
+  retry count and delay in seconds for fetching JSON information, iretry
+  and idelay are the corresponding parameters for fetching the cover
+  image, fdelay is the delay in seconds after the last contact operation
+  to ISBNdb.  The retry counts include the first attempt and so they
+  must be greater than zero.  They can be a maximum of 8.  The delays
+  must be floats or integers that are zero or greater.  Maximum delays
+  are 15 seconds, with greater values clamped to 15 seconds.
+
+  Parameters:
+
+    dbc : Connection - the Gary SQLite3 database
+
+    akey : str - the ISBNdb API key
+
+    isbn13 : str - the normalized ISBN-13 to look for
+
+    jretry : int - (optional) the number of attempts to make at fetching
+    JSON data for a book, defaults at a total of 3 attempts
+
+    jdelay : int | float - (optional) the number of seconds to delay
+    between attempts to fetch JSON data for a book, defaults at 2
+    seconds
+
+    iretry : int - (optional) the number of attempts to make at fetching
+    a cover image for a book, defaults at a total of 3 attempts
+
+    idelay : int | float - (optional) the number of seconds to delay
+    between attempts to fetch a cover image for a book, defaults at one
+    second
+
+    fdelay : int | float - (optional) the number of seconds to delay
+    after the last call to ISBNdb before returning, defaults at two
+    seconds
+
+  Return:
+
+    True if the book is now in the Gary database, False otherwise
+  """
   
   # Check optional variables
   if (not isinstance(jretry, int)) or (not isinstance(iretry, int)):
@@ -905,54 +1184,50 @@ def isbndb_query(dbc, akey, isbn13,
   return True
 
 #
-# Public functions
-# ----------------
+# Core functions
+# --------------
 #
 
-# Attempt to load information about a given book into the Gary database.
-#
-# dbpath is the path to the Gary database.  You should use the
-# gary_createdb.py utility to create a Gary database and the
-# gary_admin.py utility to set it up.
-#
-# gkey is the Gary API key.  This is returned when creating a new client
-# using the gary_admin.py utility.
-#
-# isbn13 is the ISBN-13 number to search for, which must be normalized
-# to be exactly 13 ASCII decimal digits.  This function will properly
-# apply ISBN-13 remappings.
-#
-# If information about the book is already in the Gary database, then
-# this function returns True.  Otherwise, the function attempts to load
-# information about the book from the external ISBNdb database service.
-# If this succeeds, the information is cached in the Gary database and
-# True is returned.  If the attempt to load information fails, False is
-# returned.
-#
-# The optional db_timeout parameter is an integer or float that must be
-# finite and greater than or equal to zero.  It indicates the maximum
-# number of seconds to wait for database locks.  (This only applies to
-# the SQLite database, not ISBNdb.)
-#
-# Exceptions are thrown in case of other troubles.
-#
-# Parameters:
-#
-#   dbpath : str - the path to the Gary database
-#
-#   gkey : str - the Gary API key
-#
-#   isbn13 : str - the normalized ISBN-13 of the book to load
-#
-#   db_timeout : float | int - (optional) the number of seconds to wait
-#   for SQLite locks
-#
-# Return:
-#
-#   True if the book is loaded in the database, False if information
-#   about the book couldn't be loaded
-#
-def query(dbpath, gkey, isbn13, db_timeout=5.0):
+def query(dbpath, isbn13, db_timeout=5.0):
+  """
+  Attempt to load information about a given book into the Gary database.
+
+  dbpath is the path to the Gary database.  You should use the
+  gary_createdb.py utility to create a Gary database and the
+  gary_admin.py utility to set it up.
+
+  isbn13 is the ISBN-13 number to search for, which must be normalized
+  to be exactly 13 ASCII decimal digits.  This function will properly
+  apply ISBN-13 remappings.
+
+  If information about the book is already in the Gary database, then
+  this function returns True.  Otherwise, the function attempts to load
+  information about the book from the external ISBNdb database service.
+  If this succeeds, the information is cached in the Gary database and
+  True is returned.  If the attempt to load information fails, False is
+  returned.
+
+  The optional db_timeout parameter is an integer or float that must be
+  finite and greater than or equal to zero.  It indicates the maximum
+  number of seconds to wait for database locks.  (This only applies to
+  the SQLite database, not ISBNdb.)
+
+  Exceptions are thrown in case of other troubles.
+
+  Parameters:
+
+    dbpath : str - the path to the Gary database
+
+    isbn13 : str - the normalized ISBN-13 of the book to load
+
+    db_timeout : float | int - (optional) the number of seconds to wait
+    for SQLite locks
+
+  Return:
+
+    True if the book is loaded in the database, False if information
+    about the book couldn't be loaded
+  """
   
   # If timeout is int, convert to float
   if isinstance(db_timeout, int):
@@ -968,16 +1243,12 @@ def query(dbpath, gkey, isbn13, db_timeout=5.0):
   
   # Check parameters
   if (not isinstance(dbpath, str)) or \
-      (not isinstance(gkey, str)) or \
       (not isinstance(isbn13, str)):
     raise LogicError()
   
   if not os.path.isfile(dbpath):
     raise NoDatabaseFileError()
 
-  if not valid_key(gkey):
-    raise AuthFailedError()
-  
   if not is_isbn13(isbn13):
     raise InvalidISBNError()
 
@@ -993,10 +1264,7 @@ def query(dbpath, gkey, isbn13, db_timeout=5.0):
   # the way out
   result = False
   try:
-    # First thing we need to do is check the API key
-    auth_key(dbc, gkey)
-    
-    # Next, remap the ISBN-13 if needed
+    # First thing we need to do is remap the ISBN-13 if needed
     isbn13 = apply_remap(dbc, isbn13)
     
     # Next steps depend on whether the ISBN-13 is already cached in the
@@ -1062,55 +1330,52 @@ def query(dbpath, gkey, isbn13, db_timeout=5.0):
   # Return the result
   return result
 
-# Get JSON information about a given book in the Gary database.
-#
-# This function is only able to retrieve information that has already
-# been cached in the Gary database.  It is NOT able to query ISBNdb to
-# retrieve new book information.  Use the query() function for that.
-#
-# On the other hand, this function does not require a Gary API key,
-# unlike query().  This function is also always available, even if there
-# is no ISBNdb API key registered in the Gary database.
-#
-# dbpath is the path to the Gary database.  You should use the
-# gary_createdb.py utility to create a Gary database and the
-# gary_admin.py utility to set it up.
-#
-# isbn13 is the ISBN-13 number to search for, which must be normalized
-# to be exactly 13 ASCII decimal digits.  This function will properly
-# apply ISBN-13 remappings.
-#
-# If information about the book is in the Gary database, then this
-# function returns a string containing JSON information about the book.
-# The JSON information should always be a JSON object that has a field
-# called "book", and this field is itself an object that has attributes
-# describing the book.
-#
-# If information about the book is not present in the database, None is
-# returned.
-#
-# The optional db_timeout parameter is an integer or float that must be
-# finite and greater than or equal to zero.  It indicates the maximum
-# number of seconds to wait for database locks.  (This only applies to
-# the SQLite database, not ISBNdb.)
-#
-# Exceptions are thrown in case of other troubles.
-#
-# Parameters:
-#
-#   dbpath : str - the path to the Gary database
-#
-#   isbn13 : str - the normalized ISBN-13 of the book
-#
-#   db_timeout : float | int - (optional) the number of seconds to wait
-#   for SQLite locks
-#
-# Return:
-#
-#   JSON description of the book, or None if the book information is not
-#   in the Gary database
-#
 def info(dbpath, isbn13, db_timeout=5.0):
+  """
+  Get JSON information about a given book in the Gary database.
+
+  This function is only able to retrieve information that has already
+  been cached in the Gary database.  It is NOT able to query ISBNdb to
+  retrieve new book information.  Use the query() function for that.
+ 
+  dbpath is the path to the Gary database.  You should use the
+  gary_createdb.py utility to create a Gary database and the
+  gary_admin.py utility to set it up.
+
+  isbn13 is the ISBN-13 number to search for, which must be normalized
+  to be exactly 13 ASCII decimal digits.  This function will properly
+  apply ISBN-13 remappings.
+
+  If information about the book is in the Gary database, then this
+  function returns a string containing JSON information about the book.
+  The JSON information should always be a JSON object that has a field
+  called "book", and this field is itself an object that has attributes
+  describing the book.
+
+  If information about the book is not present in the database, None is
+  returned.
+
+  The optional db_timeout parameter is an integer or float that must be
+  finite and greater than or equal to zero.  It indicates the maximum
+  number of seconds to wait for database locks.  (This only applies to
+  the SQLite database, not ISBNdb.)
+
+  Exceptions are thrown in case of other troubles.
+
+  Parameters:
+
+    dbpath : str - the path to the Gary database
+
+    isbn13 : str - the normalized ISBN-13 of the book
+
+    db_timeout : float | int - (optional) the number of seconds to wait
+    for SQLite locks
+
+  Return:
+
+    JSON description of the book, or None if the book information is not
+    in the Gary database
+  """
   
   # If timeout is int, convert to float
   if isinstance(db_timeout, int):
@@ -1197,57 +1462,54 @@ def info(dbpath, isbn13, db_timeout=5.0):
   # Return result or None
   return result
 
-# Get a cover image of a given book in the Gary database.
-#
-# This function is only able to retrieve images that have already been
-# cached in the Gary database.  It is NOT able to query ISBNdb to
-# retrieve new book information or images.  Use the query() function for
-# that.
-#
-# On the other hand, this function does not require a Gary API key,
-# unlike query().  This function is also always available, even if there
-# is no ISBNdb API key registered in the Gary database.
-#
-# dbpath is the path to the Gary database.  You should use the
-# gary_createdb.py utility to create a Gary database and the
-# gary_admin.py utility to set it up.
-#
-# isbn13 is the ISBN-13 number to search for, which must be normalized
-# to be exactly 13 ASCII decimal digits.  This function will properly
-# apply ISBN-13 remappings.
-#
-# If information about the book is in the Gary database AND the
-# information includes a cover image, then this function returns a bytes
-# object containing the raw bytes of the stored image file.  This
-# function does NOT guarantee that the returned bytes actually form a
-# valid image file.
-#
-# If information about the book is not present in the database, or the
-# book information does not include a cover image, None is returned.
-#
-# The optional db_timeout parameter is an integer or float that must be
-# finite and greater than or equal to zero.  It indicates the maximum
-# number of seconds to wait for database locks.  (This only applies to
-# the SQLite database, not ISBNdb.)
-#
-# Exceptions are thrown in case of other troubles.
-#
-# Parameters:
-#
-#   dbpath : str - the path to the Gary database
-#
-#   isbn13 : str - the normalized ISBN-13 of the book
-#
-#   db_timeout : float | int - (optional) the number of seconds to wait
-#   for SQLite locks
-#
-# Return:
-#
-#   raw bytes for the cover image stored in the database, or None if the
-#   book information is not in the Gary database or the book information
-#   does not include a cover image
-#
 def pic(dbpath, isbn13, db_timeout=5.0):
+  """
+  Get a cover image of a given book in the Gary database.
+
+  This function is only able to retrieve images that have already been
+  cached in the Gary database.  It is NOT able to query ISBNdb to
+  retrieve new book information or images.  Use the query() function for
+  that.
+
+  dbpath is the path to the Gary database.  You should use the
+  gary_createdb.py utility to create a Gary database and the
+  gary_admin.py utility to set it up.
+
+  isbn13 is the ISBN-13 number to search for, which must be normalized
+  to be exactly 13 ASCII decimal digits.  This function will properly
+  apply ISBN-13 remappings.
+
+  If information about the book is in the Gary database AND the
+  information includes a cover image, then this function returns a bytes
+  object containing the raw bytes of the stored image file.  This
+  function does NOT guarantee that the returned bytes actually form a
+  valid image file.
+
+  If information about the book is not present in the database, or the
+  book information does not include a cover image, None is returned.
+
+  The optional db_timeout parameter is an integer or float that must be
+  finite and greater than or equal to zero.  It indicates the maximum
+  number of seconds to wait for database locks.  (This only applies to
+  the SQLite database, not ISBNdb.)
+
+  Exceptions are thrown in case of other troubles.
+
+  Parameters:
+
+    dbpath : str - the path to the Gary database
+
+    isbn13 : str - the normalized ISBN-13 of the book
+
+    db_timeout : float | int - (optional) the number of seconds to wait
+    for SQLite locks
+
+  Return:
+
+    raw bytes for the cover image stored in the database, or None if the
+    book information is not in the Gary database or the book information
+    does not include a cover image
+  """
 
   # If timeout is int, convert to float
   if isinstance(db_timeout, int):
@@ -1336,3 +1598,222 @@ def pic(dbpath, isbn13, db_timeout=5.0):
 
   # Return result or None
   return result
+
+#
+# Main program functions
+# ----------------------
+#
+
+def main_json(dbpath, isbn):
+  """
+  Perform the "json" program mode.
+  
+  Parameters:
+  
+    dbpath : str - the path to the Gary database
+    
+    isbn : str - the ISBN number
+  """
+  
+  # Check parameters
+  if (not isinstance(dbpath, str)) or (not isinstance(isbn, str)):
+    raise LogicError()
+  
+  # Normalize ISBN to ISBN-13
+  isbn = norm_isbn(isbn)
+  if isbn == False:
+    raise ISBNParamError()
+  
+  # Attempt to get information about book in database if necessary
+  if not query(dbpath, isbn):
+    # Couldn't get information about book
+    print('false')
+    return
+  
+  # Get JSON result
+  result = info(dbpath, isbn)
+  if result == None:
+    # Someone must have deleted our records since the query call above
+    print('false')
+    return
+  
+  # If we got here, we have the result, so print it
+  print(result)
+
+def main_pic(dbpath, isbn):
+  """
+  Perform the "pic" program mode.
+  
+  Parameters:
+  
+    dbpath : str - the path to the Gary database
+    
+    isbn : str - the ISBN number
+  """
+  
+  # Check parameters
+  if (not isinstance(dbpath, str)) or (not isinstance(isbn, str)):
+    raise LogicError()
+  
+  # Normalize ISBN to ISBN-13
+  isbn = norm_isbn(isbn)
+  if isbn == False:
+    raise ISBNParamError()
+  
+  # Attempt to get information about book in database if necessary
+  if not query(dbpath, isbn):
+    # Couldn't get information about book
+    print('false')
+    return
+  
+  # Get binary result
+  result = pic(dbpath, isbn)
+  if result == None:
+    # No picture available
+    print('false')
+    return
+  
+  # If we got here, we have the result, so print it -- but since it's a
+  # binary file, we have to do a binary write
+  sys.stdout.buffer.write(result)
+
+def main_query(dbpath, isbn):
+  """
+  Perform the "query" program mode.
+  
+  Parameters:
+  
+    dbpath : str - the path to the Gary database
+    
+    isbn : str - the ISBN number
+  """
+  
+  # Check parameters
+  if (not isinstance(dbpath, str)) or (not isinstance(isbn, str)):
+    raise LogicError()
+  
+  # Normalize ISBN to ISBN-13
+  isbn = norm_isbn(isbn)
+  if isbn == False:
+    raise ISBNParamError()
+  
+  # Attempt to get information about book in database if necessary
+  if query(dbpath, isbn):
+    # Could get information about book
+    print('true')
+    
+  else:
+    # Couldn't get information about book
+    print('false')
+
+def main_sync(dbpath):
+  """
+  Perform the "sync" program mode.
+  
+  Parameters:
+  
+    dbpath : str - the path to the Gary database
+  """
+  
+  global LONG_RETRY_COUNT
+  
+  # Check parameter
+  if not isinstance(dbpath, str):
+    raise LogicError()
+  
+  # Read all lines of standard input
+  for line in sys.stdin:
+    
+    # Strip leading and trailing whitespace
+    line = line.strip()
+    
+    # If line now empty, skip it
+    if len(line) < 1:
+      continue
+    
+    # Get a normalized ISBN for the line
+    isbn = norm_isbn(line)
+    if isbn == False:
+      raise BadSyncListError()
+    
+    # Keep trying until we download information about book or our long
+    # retry count expires
+    attempt_success = False
+    for i in range(0, LONG_RETRY_COUNT):
+      # Make an attempt
+      if query(dbpath, isbn):
+        # Got information about the book
+        attempt_success = True
+        break
+    
+    # If we couldn't get information about the book even after looping,
+    # fail
+    if not attempt_success:
+      print(pModule, 'Can\'t load ISBN:', isbn, file=sys.stderr)
+      raise SyncError()
+    
+    # If we got here, report the book we just loaded
+    print(pModule, 'Loaded info for ISBN:', isbn, file=sys.stderr)
+
+#
+# Program entrypoint
+# ------------------
+#
+
+# Make sure at least two arguments beyond module name
+#
+if len(sys.argv) < 3:
+  print(pModule, 'Too few program arguments!', file=sys.stderr)
+  sys.exit(1)
+
+# Call through to appropriate main function and handle reporting any
+# exceptions that are thrown
+#
+try:
+  mode_name = sys.argv[2]
+  if mode_name == 'json':
+    # Check number of parameters
+    if len(sys.argv) != 4:
+      raise ProgramParamError()
+    
+    # Call through
+    main_json(sys.argv[1], sys.argv[3])
+    
+  elif mode_name == 'pic':
+    # Check number of parameters
+    if len(sys.argv) != 4:
+      raise ProgramParamError()
+    
+    # Call through
+    main_pic(sys.argv[1], sys.argv[3])
+    
+  elif mode_name == 'query':
+    # Check number of parameters
+    if len(sys.argv) != 4:
+      raise ProgramParamError()
+    
+    # Call through
+    main_query(sys.argv[1], sys.argv[3])
+    
+  elif mode_name == 'sync':
+    # Check number of parameters
+    if len(sys.argv) != 3:
+      raise ProgramParamError()
+    
+    # Call through
+    main_sync(sys.argv[1])
+    
+  else:
+    # Unrecognized mode
+    raise ProgramModeError()
+
+except GaryError as ge:
+  print(pModule, ge, file=sys.stderr)
+  print('false')
+  sys.exit(1)
+
+except:
+  print(pModule, 'Unexpected error!', file=sys.stderr)
+  traceback.print_exc(file=sys.stderr)
+  print('false')
+  sys.exit(1)
