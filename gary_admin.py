@@ -12,10 +12,6 @@
 #   python3 gary_admin.py [dbpath] isbndb ([api_key] [lockfile_path]) 
 #   python3 gary_admin.py [dbpath] isbndb_status
 #
-#   python3 gary_admin.py [dbpath] client_add [desc]
-#   python3 gary_admin.py [dbpath] client_drop [tkid]
-#   python3 gary_admin.py [dbpath] client_list
-#
 # [dbpath] is always the path to the existing Gary SQLite database to
 # open.  It must pass os.path.isfile(), indicating that it is a regular
 # file that exists.  You can use gary_createdb.py to create a new, empty
@@ -108,52 +104,6 @@
 # not a symbolic link (os.path.isfile() must be True, os.path.islink()
 # must be False) and the path must be absolute (os.path.isabs() passes).
 #
-# client_add
-# ----------
-#
-# The "client_add" command adds a new client access key to the Gary
-# database.  This allows you to register new clients to use Gary.
-#
-# The [desc] parameter is a string that may only contain US-ASCII
-# printing characters, including the space.  It may not be empty after
-# trimming leading and trailing whitespace.  It is used only for giving
-# a description of who the client is in the "client_list" function.
-#
-# The function will print out an API key of 32 base-64 digits in URL
-# encoding with no padding.  The first eight digits are the client ID
-# and the last 24 digits are the API key.  This API key is NOT stored in
-# plain text in the database, so if you forget the full API key that is
-# output by this function, there is no way to recover the key.
-#
-# This full API key is all that is needed to authenticate a Gary client.
-# It remains valid so long as the client remains in the client table.
-#
-# client_drop
-# -----------
-#
-# The "client_drop" command drops a client from the Gary database.  The
-# API keys of dropped clients will no longer work after the client is
-# dropped.
-#
-# The [tkid] parameter must be eight base-64 digits in URL encoding that
-# identify the specific client to drop.  You can get the client ID
-# either from the first eight characters of an API key, or by using the
-# client_list command.
-#
-# client_list
-# -----------
-#
-# The "client_list" command prints a list of all the clients that are
-# registered in the database, in ascending chronological order of the
-# time that they were added to the database.
-#
-# For each client, the unique client ID, the date they were added, and
-# the description they were added with is printed.
-#
-# There is no way to determine the API key of a client with this
-# function because the API keys are not stored in plain text and can not
-# be recovered in any way.
-#
 
 import base64
 import datetime
@@ -192,17 +142,9 @@ class BadParamError(AdminDBError):
   def __str__(self):
     return 'Wrong number of parameters for admin command!'
 
-class EmptyDescError(AdminDBError):
-  def __str__(self):
-    return 'Client description may not be empty!'
-
 class InvalidAPIKeyError(AdminDBError):
   def __str__(self):
     return 'Invalid API key!'
-
-class InvalidClientIDError(AdminDBError):
-  def __str__(self):
-    return 'Invalid unique client ID code!'
 
 class InvalidISBNError(AdminDBError):
   def __str__(self):
@@ -219,10 +161,6 @@ class LogicError(AdminDBError):
 class NotFoundError(AdminDBError):
   def __str__(self):
     return 'Database file not found!'
-
-class NotUniqueError(AdminDBError):
-  def __str__(self):
-    return 'Can\'t generate unique ID!'
 
 class OpenCursorError(AdminDBError):
   def __str__(self):
@@ -825,294 +763,6 @@ def statusAPIKey(dbc):
   finally:
     cur.close()
 
-# Add a new client for the Gary database and print the API key.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# desc is the description of the client.  This is only used in client
-# listings so that the administrator can identify what each database
-# client is.
-#
-# Exceptions are raised if there are any problems.
-#
-# The database connection is NOT closed on the way out.
-#
-# Parameters:
-#
-#   dbc - Connection : the Gary SQLite3 database
-#
-#   desc - str | mixed : the description of the client
-#
-#   id_retry - int: (optional) the maximum number of times to retry
-#   unique ID regeneration
-#
-def addClient(dbc, desc, id_retry=16):
-  
-  # Check optional parameter
-  if not isinstance(id_retry, int):
-    raise LogicError()
-  if id_retry < 1:
-    raise LogicError()
-  
-  # Check database connection
-  if not isinstance(dbc, sqlite3.Connection):
-    raise LogicError()
-  if dbc.isolation_level != None:
-    raise LogicError()
-  
-  # Normalize and check description
-  if not isinstance(desc, str):
-    desc = ''
-  desc = desc.strip()
-  if len(desc) < 1:
-    raise EmptyDescError()
-  
-  # Get the current time for the timestamp
-  ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-  
-  # Get a cursor for modifying the database
-  cur = None
-  try:
-    cur = dbc.cursor()
-  except Exception as e:
-    raise OpenCursorError() from e
-  
-  # Wrap the rest in a try-finally so that the cursor is always closed
-  # on the way out; also, rethrow any exceptions as SQLErrors
-  try:
-    # Begin an immediate transaction so the whole operation is performed
-    # in one go
-    cur.execute('BEGIN IMMEDIATE TRANSACTION')
-    
-    # Wrap the rest in a try-catch so that in case of any error, the
-    # transaction is rolled back before the exception is rethrown
-    try:
-      # Keep generating IDs and passwords until we find a unique one
-      rs = None
-      rs_user = None
-      rs_pswd = None
-      for i in range(0, id_retry):
-        # Generate 32 random URL-safe base-64 digits from 24 random bytes
-        rs = base64.urlsafe_b64encode(os.urandom(24))
-        
-        # Extract random username and random password
-        rs_str = str(rs, encoding='utf-8')
-        rs_user = rs_str[0:8]
-        rs_pswd = rs[8:]
-        
-        # Check if random username already in use
-        cur.execute('SELECT tkid FROM client WHERE tkid=?', (rs_user,))
-        if cur.fetchone() is None:
-          # ID is unique, so leave loop because we got an ID
-          break
-        else:
-          # ID is not unique, so reset and try again
-          rs = None
-          rs_user = None
-          rs_pswd = None
-      
-      # If we didn't manage to generate a unique ID, error
-      if rs is None:
-        raise NotUniqueError()
-      
-      # Take the SHA-256 digest of the password -- since the password is
-      # completely random, we shouldn't have to worry about salts, and
-      # password-specific hashing seems unnecessary -- and then get a
-      # normal base-64 encoding of it
-      m = hashlib.sha256()
-      m.update(rs_pswd)
-      rs_pswd = str(base64.b64encode(m.digest()), encoding='utf-8')
-      
-      # Convert the full API key to a string
-      rs = str(rs, encoding='utf-8')
-      
-      # Add the new database record
-      cur.execute('INSERT INTO client(entry, tkid, pswd, desc) '
-                  'VALUES (?, ?, ?, ?)',
-                  (ts, rs_user, rs_pswd, desc))
-      
-      # Commit the transaction to update the database all at once
-      cur.execute('COMMIT TRANSACTION')
-      
-      # Print the API key for the new client
-      print('Gary API key for new client:')
-      print(rs)
-    
-    except Exception as f:
-      cur.execute('ROLLBACK TRANSACTION')
-      raise f
-  
-  except NotUniqueError as nue:
-    raise nue
-  
-  except Exception as e:
-    raise SQLError() from e
-  
-  finally:
-    cur.close()
-
-# Drop a client from the database.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# tkid is unique ID of the client to drop.  This is the first eight
-# characters of the Gary API key, or it can be determined by the client
-# list function.  The given ID will be normalized by trimming leading
-# and trailing whitespace.
-#
-# Exceptions are raised if there are any problems.
-#
-# The database connection is NOT closed on the way out.
-#
-# Parameters:
-#
-#   dbc - Connection : the Gary SQLite3 database
-#
-#   tkid - str : the unique client ID to drop
-#
-def dropClient(dbc, tkid):
-  
-  # Check database connection
-  if not isinstance(dbc, sqlite3.Connection):
-    raise LogicError()
-  if dbc.isolation_level != None:
-    raise LogicError()
-  
-  # Check and normalize unique ID parameter
-  if not isinstance(tkid, str):
-    raise LogicError()
-  tkid = tkid.strip()
-  if len(tkid) != 8:
-    raise InvalidClientIDError()
-  for cc in tkid:
-    c = ord(cc)
-    if ((c < ord('A')) or (c > ord('Z'))) and \
-        ((c < ord('a')) or (c > ord('z'))) and \
-        ((c < ord('0')) or (c > ord('9'))) and \
-        (c != ord('-')) and (c != ord('_')):
-      raise InvalidClientIDError()
-  
-  # Get a cursor for modifying the database
-  cur = None
-  try:
-    cur = dbc.cursor()
-  except Exception as e:
-    raise OpenCursorError() from e
-  
-  # Wrap the rest in a try-finally so that the cursor is always closed
-  # on the way out; also, rethrow any exceptions as SQLErrors
-  try:
-    # Begin an immediate transaction so the whole operation is performed
-    # in one go
-    cur.execute('BEGIN IMMEDIATE TRANSACTION')
-    
-    # Wrap the rest in a try-catch so that in case of any error, the
-    # transaction is rolled back before the exception is rethrown
-    try:
-      # Delete the client record from the table
-      cur.execute('DELETE FROM client WHERE tkid=?', (tkid,))
-      
-      # Commit the transaction to update the database all at once
-      cur.execute('COMMIT TRANSACTION')
-    
-    except Exception as f:
-      cur.execute('ROLLBACK TRANSACTION')
-      raise f
-    
-  except Exception as e:
-    raise SQLError() from e
-  
-  finally:
-    cur.close()
-
-# List all the registered clients in the database.
-#
-# dbc is the open connection to the Gary database.  It must be open in
-# auto-commit mode (isolation_level is None).
-#
-# Exceptions are raised if there are any problems.
-#
-# The database connection is NOT closed on the way out.
-#
-# Parameters:
-#
-#   dbc - Connection : the Gary SQLite3 database
-#
-def listClient(dbc):
-  
-  # Check database connection
-  if not isinstance(dbc, sqlite3.Connection):
-    raise LogicError()
-  if dbc.isolation_level != None:
-    raise LogicError()
-  
-  # Get a cursor for reading the database
-  cur = None
-  try:
-    cur = dbc.cursor()
-  except Exception as e:
-    raise OpenCursorError() from e
-  
-  # Wrap the rest in a try-finally so that the cursor is always closed
-  # on the way out; also, rethrow any exceptions as SQLErrors
-  try:
-    # Begin a deferred transaction because we're only reading
-    cur.execute('BEGIN DEFERRED TRANSACTION')
-    
-    # Wrap the rest in a try-catch so that in case of any error, the
-    # transaction is rolled back before the exception is rethrown
-    try:
-      # Select all clients, sorted by increasing entry timestamp
-      cur.execute(
-        'SELECT entry, tkid, desc FROM client ORDER BY entry ASC')
-      
-      # Get first record, if there is one
-      r = cur.fetchone()
-      
-      # If no clients at all, report it; otherwise, print all clients
-      if r is None:
-        print('No clients are registered.')
-        
-      else:
-        first_rec = True
-        while r is not None:
-          # Get the parameters of this client
-          entry = r[0]
-          tkid = r[1]
-          desc = r[2]
-          
-          # Reformat the entry timestamp as a date
-          entry = datetime.date.fromtimestamp(entry)
-          entry = entry.isoformat()
-          
-          # Print blank line if necessary
-          if first_rec:
-            first_rec = False
-          else:
-            print()
-          
-          # Print this client information
-          print('Client', tkid, 'entered', entry)
-          print(desc)
-          
-          # Get next record, if there is one
-          r = cur.fetchone()
-      
-      # Commit the transaction to update the database all at once
-      cur.execute('COMMIT TRANSACTION')
-    
-    except Exception as f:
-      cur.execute('ROLLBACK TRANSACTION')
-      raise f
-    
-  except Exception as e:
-    raise SQLError() from e
-  
-  finally:
-    cur.close()
-
 # The main program function.
 #
 # Pass in the path to the database and the command and argument list.
@@ -1218,31 +868,6 @@ def admin_main(dbpath, cmdarg, db_timeout=5.0):
       if len(cmdarg) == 1:
         statusAPIKey(dbc)
       
-      else:
-        raise BadParamError()
-    
-    elif cmd == 'client_add':
-      # Add client command must have exactly one additional parameter
-      if len(cmdarg) == 2:
-        addClient(dbc, cmdarg[1])
-        
-      else:
-        raise BadParamError()
-    
-    elif cmd == 'client_drop':
-      # Drop client command must have exactly one additional parameter
-      if len(cmdarg) == 2:
-        dropClient(dbc, cmdarg[1])
-        
-      else:
-        raise BadParamError()
-    
-    elif cmd == 'client_list':
-      # List clients command must have no additional parameters
-      if len(cmdarg) == 1:
-        listClient(dbc)
-        pass
-        
       else:
         raise BadParamError()
     
