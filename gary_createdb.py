@@ -269,22 +269,6 @@ def createdb_main(dbpath, db_timeout=5.0):
           'ON keys(kname)')
         
         cur.execute(
-          'CREATE TABLE client('
-          'id INTEGER PRIMARY KEY ASC, '
-          'entry INTEGER NOT NULL, '
-          'tkid TEXT UNIQUE NOT NULL, '
-          'pswd TEXT NOT NULL, '
-          'desc TEXT NOT NULL)')
-        
-        cur.execute(
-          'CREATE UNIQUE INDEX ix_client_tkid '
-          'ON client(tkid)')
-        
-        cur.execute(
-          'CREATE INDEX ix_client_entry '
-          'ON client(entry)')
-        
-        cur.execute(
           'CREATE TABLE books('
           'id INTEGER PRIMARY KEY ASC, '
           'isbn13 TEXT UNIQUE NOT NULL, '
