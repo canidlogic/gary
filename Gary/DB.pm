@@ -197,7 +197,7 @@ sub DESTROY {
 
 =over 4
 
-=item B<Gary::DB->string_to_db(str)>
+=item Gary::DB->B<string_to_db(str)>
 
 Get a binary UTF-8 string copy of a given Unicode string.
 
@@ -223,7 +223,7 @@ sub string_to_db {
   return encode('UTF-8', $str, Encode::FB_CROAK);
 }
 
-=item B<Gary::DB->db_to_string(str)>
+=item Gary::DB->B<db_to_string(str)>
 
 Get a Unicode string copy of a given binary UTF-8 string.
 
